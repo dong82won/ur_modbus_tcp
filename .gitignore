@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# .vscode 폴더 내의 모든 파일 무시
+.vscode/*
+# 단, 팀원과 공유해야 하는 .json 설정 파일은 Git 추적에 포함
+!.vscode/*.json
