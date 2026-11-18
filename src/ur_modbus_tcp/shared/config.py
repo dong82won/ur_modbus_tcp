@@ -24,7 +24,7 @@ class ModbusConfig:
   min_decision_margin: float = 35.0  # 오검출 필터링 임계값 (낮으면 노이즈 제거 강화)
 
   # OpenCV 실시간 화면 표시 여부 (모니터 없는 운영 환경에서는 False로 변경)
-  show_preview: bool = True
+  show_preview: bool = True #False
 
 
 CONFIG = ModbusConfig()

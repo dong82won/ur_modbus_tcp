@@ -16,24 +16,26 @@ from ur_modbus_tcp.shared.register_map import TagDetection
 # C++ 확장 모듈(pyrealsense2)에 대한 Pylance 속성 인식 오류 방지
 rs: Any = _rs
 logger = logging.getLogger(__name__)
+_stdio_lock = threading.Lock()
 
 
 @contextmanager
 def suppress_c_output():
-    """C 라이브러리(pupil_apriltags)에서 발생하는 stdout/stderr 터미널 강제 출력을 무시"""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    old_stdout = os.dup(1)
-    old_stderr = os.dup(2)
-    try:
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        yield
-    finally:
-        os.dup2(old_stdout, 1)
-        os.dup2(old_stderr, 2)
-        os.close(old_stdout)
-        os.close(old_stderr)
-        os.close(devnull)
+    """C 라이브러리(pupil_apriltags)에서 발생하는 stdout/stderr 터미널 강제 출력을 스레드 안전하게 무시"""
+    with _stdio_lock:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stdout = os.dup(1)
+        old_stderr = os.dup(2)
+        try:
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            yield
+        finally:
+            os.dup2(old_stdout, 1)
+            os.dup2(old_stderr, 2)
+            os.close(old_stdout)
+            os.close(old_stderr)
+            os.close(devnull)
 
 
 class _AprilTagDetection(Protocol):
@@ -55,16 +57,22 @@ class RealSenseAprilTagProvider:
         transformer: HandEyeTransformer | None = None,
         allowed_tag_ids: set[int] | None = None,
         reconnect_interval: float = 2.0,
+        preview_detect_stride: int = 3,
     ) -> None:
         self.transformer = transformer or HandEyeTransformer()
         self.allowed_tag_ids = allowed_tag_ids
         self._reconnect_interval = reconnect_interval
+        self._preview_detect_stride = max(1, preview_detect_stride)
 
         self._frame_lock = threading.Lock()
         self._detector_lock = threading.Lock()
+        self._active_requests = 0
 
         self._latest_gray: NDArray[np.uint8] | None = None
         self._latest_preview: NDArray[np.uint8] | None = None
+        self._cached_preview_detections: list[_AprilTagDetection] = []
+        self._frame_counter = 0
+
         self._camera_params: tuple[float, float, float, float] | None = None
         self._camera_matrix: NDArray[np.float64] | None = None
         self._dist_coeffs = np.zeros((4, 1), dtype=np.float64)
@@ -74,6 +82,7 @@ class RealSenseAprilTagProvider:
         self._capture_thread: threading.Thread | None = None
         self._pipeline = rs.pipeline()
 
+        # 1. 로봇 제어용 고정밀 검출기 (Modbus 요청 전용)
         self._detector = Detector(
             families=CONFIG.tag_family,
             nthreads=2,
@@ -83,6 +92,19 @@ class RealSenseAprilTagProvider:
             decode_sharpening=0.25,
             debug=0,
         )
+
+        # 2. 화면 오버레이용 독립 검출기 (락 경합 원천 차단 + 640x480 소형 태그 검출 정밀도 유지)
+        self._preview_detector: Detector | None = None
+        if CONFIG.show_preview:
+            self._preview_detector = Detector(
+                families=CONFIG.tag_family,
+                nthreads=1,
+                quad_decimate=1.0,
+                quad_sigma=0.0,
+                refine_edges=1,
+                decode_sharpening=0.25,
+                debug=0,
+            )
 
         self._connect_camera()
 
@@ -151,34 +173,20 @@ class RealSenseAprilTagProvider:
         self._is_connected = False
         self._camera_params = None
         self._camera_matrix = None
+        self._frame_counter = 0
         with self._frame_lock:
             self._latest_gray = None
             self._latest_preview = None
+            self._cached_preview_detections = []
         try:
             self._pipeline.stop()
         except Exception:
             pass
 
-    def _run_detector(
-        self, gray_img: NDArray[np.uint8]
+    def _filter_detections(
+        self, raw_detections: list[_AprilTagDetection]
     ) -> list[_AprilTagDetection]:
-        """스레드 안전한 AprilTag 검출 및 유효성 필터링"""
-        if self._camera_params is None:
-            return []
-
-        with self._detector_lock:
-            # C레벨 알고리즘 경고(Error, more than one new minima found) 터미널 출력 무시
-            with suppress_c_output():
-                raw_detections = cast(
-                    list[_AprilTagDetection],
-                    self._detector.detect(
-                        gray_img,
-                        estimate_tag_pose=True,
-                        camera_params=self._camera_params,
-                        tag_size=CONFIG.tag_size_m,
-                    ),
-                )
-
+        """유효성 및 허용 태그 ID 필터링 공통 로직"""
         return [
             d
             for d in raw_detections
@@ -190,6 +198,47 @@ class RealSenseAprilTagProvider:
                 or int(d.tag_id) in self.allowed_tag_ids
             )
         ]
+
+    def _run_detector(
+        self, gray_img: NDArray[np.uint8]
+    ) -> list[_AprilTagDetection]:
+        """로봇 요청용 스레드 안전 AprilTag 검출"""
+        if self._camera_params is None:
+            return []
+
+        with self._detector_lock:
+            with suppress_c_output():
+                raw_detections = cast(
+                    list[_AprilTagDetection],
+                    self._detector.detect(
+                        gray_img,
+                        estimate_tag_pose=True,
+                        camera_params=self._camera_params,
+                        tag_size=CONFIG.tag_size_m,
+                    ),
+                )
+
+        return self._filter_detections(raw_detections)
+
+    def _run_preview_detector(
+        self, gray_img: NDArray[np.uint8]
+    ) -> list[_AprilTagDetection]:
+        """미리보기 전용 독립 검출 (메인 검출기와 락을 공유하지 않음)"""
+        if self._camera_params is None or self._preview_detector is None:
+            return []
+
+        with suppress_c_output():
+            raw_detections = cast(
+                list[_AprilTagDetection],
+                self._preview_detector.detect(
+                    gray_img,
+                    estimate_tag_pose=True,
+                    camera_params=self._camera_params,
+                    tag_size=CONFIG.tag_size_m,
+                ),
+            )
+
+        return self._filter_detections(raw_detections)
 
     def _draw_detections(
         self,
@@ -252,13 +301,15 @@ class RealSenseAprilTagProvider:
             lines = [
                 f"ID: {int(d.tag_id)} (margin: {d.decision_margin:.1f})",
                 f"Cam XYZ:({cam_x:+.3f}, {cam_y:+.3f}, {cam_z:+.3f}) m",
-                f"TCP XYZ:({tcp_x:+.3f}, {tcp_y:+.3f}, {tcp_z:+.3f}) m", # Base -> TCP로 표기 변경
+                f"TCP XYZ:({tcp_x:+.3f}, {tcp_y:+.3f}, {tcp_z:+.3f}) m",
             ]
 
             # 텍스트가 화면 밖으로 잘리지 않도록 위치 보정
             min_x = max(10, min(img_w - 330, int(np.min(d.corners[:, 0]))))
             min_y = int(np.min(d.corners[:, 1]))
-            text_y_start = min_y - 62 if min_y > 75 else int(np.max(d.corners[:, 1])) + 22
+            text_y_start = (
+                min_y - 62 if min_y > 75 else int(np.max(d.corners[:, 1])) + 22
+            )
             text_y_start = max(20, min(img_h - 65, text_y_start))
 
             # 가독성을 위한 반투명/어두운 배경 박스
@@ -300,18 +351,36 @@ class RealSenseAprilTagProvider:
                 bgr_img = np.asanyarray(color_frame.get_data())
                 gray_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
 
-                preview_img: NDArray[np.uint8] | None = None
-                if CONFIG.show_preview:
-                    detections = self._run_detector(gray_img)
-                    preview_img = self._draw_detections(bgr_img, detections)
-
+                # 로봇 요청 스레드가 즉시 최신 프레임을 가져갈 수 있도록 먼저 저장
                 with self._frame_lock:
                     self._latest_gray = gray_img
+                    is_request_active = self._active_requests > 0
+
+                preview_img: NDArray[np.uint8] | None = None
+                if CONFIG.show_preview:
+                    self._frame_counter += 1
+                    # 로봇 요청이 없을 때만 N프레임당 1회 독립 검출기 실행
+                    if (
+                        not is_request_active
+                        and self._frame_counter % self._preview_detect_stride == 0
+                    ):
+                        detections = self._run_preview_detector(gray_img)
+                        with self._frame_lock:
+                            self._cached_preview_detections = detections
+
+                    with self._frame_lock:
+                        draw_targets = list(self._cached_preview_detections)
+
+                    preview_img = self._draw_detections(bgr_img, draw_targets)
+
+                with self._frame_lock:
                     self._latest_preview = preview_img
 
             except Exception as err:
                 if self._running:
-                    logger.error(f"RealSense 프레임 수신 중단 (카메라 분리/오류): {err}")
+                    logger.error(
+                        f"RealSense 프레임 수신 중단 (카메라 분리/오류): {err}"
+                    )
                     self._disconnect_cleanup()
 
     def get_preview_frame(self) -> NDArray[np.uint8]:
@@ -333,55 +402,52 @@ class RealSenseAprilTagProvider:
         )
         return blank
 
-    # def detect_and_transform(self) -> TagDetection:
-    #     """UR 요청 시 최신 프레임에서 tag36h11을 검출하고 Robot Base 6-DoF 반환"""
-    #     if not self._is_connected or self._camera_params is None:
-    #         raise RuntimeError("RealSense 카메라가 연결되어 있지 않습니다.")
-
-    #     with self._frame_lock:
-    #         if self._latest_gray is None:
-    #             raise RuntimeError("카메라 프레임이 아직 수신되지 않았습니다.")
-    #         gray_img = self._latest_gray.copy()
-
-    #     valid_detections = self._run_detector(gray_img)
-    #     if not valid_detections:
-    #         raise RuntimeError("유효한 tag36h11 마커가 검출되지 않았습니다.")
-
-    #     best = max(valid_detections, key=lambda d: float(d.decision_margin))
-    #     if best.pose_R is None or best.pose_t is None:
-    #         raise RuntimeError("AprilTag 포즈 행렬(pose_R/pose_t) 추정 실패")
-
-    #     # 카메라 기준 포즈 -> 로봇 TCP 기준 6-DoF 변환
-    #     tcp_pose = self.transformer.cam_to_tcp_pose(best.pose_R, best.pose_t)
-    #     return TagDetection(tag_id=int(best.tag_id), pose=tcp_pose)
-
     def detect_and_transform(self, max_retries: int = 6) -> TagDetection:
-        """UR 요청 시 최신 프레임에서 tag36h11을 검출. 실패 시 최대 6회(약 0.3초) 재시도"""
+        """UR 요청 시 최신 프레임에서 tag36h11을 검출 (미리보기보다 우선 실행 및 결과 동기화)"""
         if not self._is_connected or self._camera_params is None:
             raise RuntimeError("RealSense 카메라가 연결되어 있지 않습니다.")
 
-        for attempt in range(max_retries):
+        with self._frame_lock:
+            self._active_requests += 1
+        try:
+            for _ in range(max_retries):
+                with self._frame_lock:
+                    gray_img = (
+                        None
+                        if self._latest_gray is None
+                        else self._latest_gray.copy()
+                    )
+
+                if gray_img is not None:
+                    valid_detections = self._run_detector(gray_img)
+
+                    # 유효한 태그를 찾은 경우 미리보기 캐시에도 동기화하고 즉시 좌표 반환
+                    if valid_detections:
+                        with self._frame_lock:
+                            self._cached_preview_detections = list(valid_detections)
+
+                        best = max(
+                            valid_detections,
+                            key=lambda d: float(d.decision_margin),
+                        )
+                        if best.pose_R is not None and best.pose_t is not None:
+                            tcp_pose = self.transformer.cam_to_tcp_pose(
+                                best.pose_R, best.pose_t
+                            )
+                            return TagDetection(
+                                tag_id=int(best.tag_id), pose=tcp_pose
+                            )
+
+                # 실패 시 다음 프레임이 캡처될 때까지 잠시 대기 (약 30fps 기준 50ms)
+                time.sleep(0.05)
+
+            # 지정된 횟수만큼 재시도했음에도 못 찾은 경우에만 에러(2) 발생
+            raise RuntimeError(
+                f"유효한 tag36h11 마커가 검출되지 않았습니다. ({max_retries}회 재시도 실패)"
+            )
+        finally:
             with self._frame_lock:
-                if self._latest_gray is None:
-                    gray_img = None
-                else:
-                    gray_img = self._latest_gray.copy()
-
-            if gray_img is not None:
-                valid_detections = self._run_detector(gray_img)
-
-                # 유효한 태그를 찾은 경우 즉시 좌표 반환
-                if valid_detections:
-                    best = max(valid_detections, key=lambda d: float(d.decision_margin))
-                    if best.pose_R is not None and best.pose_t is not None:
-                        tcp_pose = self.transformer.cam_to_tcp_pose(best.pose_R, best.pose_t)
-                        return TagDetection(tag_id=int(best.tag_id), pose=tcp_pose)
-
-            # 실패 시 다음 프레임이 캡처될 때까지 잠시 대기 (약 30fps 기준 50ms)
-            time.sleep(0.05)
-
-        # 지정된 횟수만큼 재시도했음에도 못 찾은 경우에만 에러(2) 발생
-        raise RuntimeError(f"유효한 tag36h11 마커가 검출되지 않았습니다. ({max_retries}회 재시도 실패)")
+                self._active_requests = max(0, self._active_requests - 1)
 
     def stop(self) -> None:
         """서버 종료 시 RealSense 파이프라인 안전 해제"""

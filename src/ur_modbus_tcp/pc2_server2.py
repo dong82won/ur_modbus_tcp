@@ -9,10 +9,10 @@ import time
 import cv2
 from collections.abc import Callable
 from pymodbus.server import ModbusTcpServer
-
 from pymodbus.simulator import DataType, SimData, SimDevice
 
-from ur_modbus_tcp.realsense_pose import RealSenseAprilTagProvider
+from ur_modbus_tcp.realsense_pose2 import RealSenseAprilTagProvider
+
 from ur_modbus_tcp.shared.config import CONFIG
 from ur_modbus_tcp.shared.register_map import (
     AckStatus,
@@ -117,10 +117,14 @@ async def async_server_main(
 
     # 이벤트 루프가 완전히 활성화된 상태에서 서버 객체 생성
     server = ModbusTcpServer(context=device, address=(CONFIG.server_host, CONFIG.port))
-    hs_task = asyncio.create_task(handshake_worker(server, provider.detect_and_transform))
-    serve_task = asyncio.create_task(server.serve_forever())
 
+    # 🌟 [핵심 수정] 서버가 네트워크 Listen을 시작할 때까지 대기
+    await server.serve_forever(background=True)
     logger.info(f"Ubuntu Modbus TCP 서버 대기 중 ({CONFIG.server_host}:{CONFIG.port})...")
+
+    # 서버 준비가 완료된 후 핸드셰이크 워커 실행
+    hs_task = asyncio.create_task(handshake_worker(server, provider.detect_and_transform))
+
 
     # 메인 스레드에서 종료 신호(stop_event)를 보낼 때까지 대기
     while not stop_event.is_set():
@@ -130,7 +134,6 @@ async def async_server_main(
     logger.info("Modbus 서버 종료 절차 시작...")
     hs_task.cancel()
     await server.shutdown()
-    serve_task.cancel()
 
 
 def run_async_server(

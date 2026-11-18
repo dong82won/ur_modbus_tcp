@@ -18,7 +18,7 @@ dependencies = [
 
 [project.scripts]
 server = "ur_modbus_tcp.pc2_server2:run"
-client = "ur_modbus_tcp.pc1_client:run"
+client = "ur_modbus_tcp.pc1_client2:run"
 
 
 [build-system]
